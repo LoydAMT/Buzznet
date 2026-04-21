@@ -1,6 +1,5 @@
 import { initializeApp } from "firebase/app";
 import { getDatabase } from "firebase/database";
-// 1. THIS MUST BE AT THE TOP
 import { getAuth } from "firebase/auth"; 
 
 const firebaseConfig = {
@@ -13,9 +12,7 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
-// Initialize Firebase
 const app = initializeApp(firebaseConfig);
 
 export const database = getDatabase(app);
-// 2. THIS MUST BE AT THE VERY BOTTOM
 export const auth = getAuth(app);
