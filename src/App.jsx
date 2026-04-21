@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import Spline from '@splinetool/react-spline';
-import { QRCodeCanvas } from 'qrcode.react'; // ADDED QR CODE LIBRARY
+import { QRCodeCanvas } from 'qrcode.react';
 import Auth from './Auth';
 import { database, auth } from './firebase';
 import { ref, onValue, set, get, onDisconnect } from "firebase/database";
@@ -50,9 +50,13 @@ export default function BuzzNetDashboard() {
 
   const [session, setSession] = useState(null);
   const [timeLeft, setTimeLeft] = useState(0);
-  
-  // NEW: QR Code Modal State
+
+  // QR Code Modal State
   const [showQR, setShowQR] = useState(false);
+
+  // --- RATE STATE ---
+  const [ratePerPeso, setRatePerPeso] = useState(5);
+  const [adminRateInput, setAdminRateInput] = useState(5);
 
   // --- RESPONSIVE LISTENER ---
   useEffect(() => {
@@ -61,54 +65,43 @@ export default function BuzzNetDashboard() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // --- DEVICE CONNECTION LISTENER (Triggered via QR Scan) ---
+  // --- DEVICE CONNECTION LISTENER ---
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const connectLocker = params.get('lockerId');
     const hostUid = params.get('host');
 
-    if (connectLocker && hostUid) {
-      const deviceId = getDeviceId();
-      const deviceName = getDeviceName();
+    if (!connectLocker || !hostUid) return;
 
-      const sessionRef = ref(database, `users/${hostUid}/session`);
-      get(sessionRef).then(snap => {
-        const sessionData = snap.val();
-        if (sessionData && String(sessionData.lockerId) === String(connectLocker)) {
-          let devices = sessionData.devices || [];
-          
-          // Check if device is already connected
-          if (devices.find(d => d.deviceId === deviceId)) {
-            alert(`✅ This device (${deviceName}) is already connected to Buzzer #${connectLocker}.`);
-            window.history.replaceState({}, document.title, window.location.pathname);
-            return;
-          }
-          
-          // Check limit (Max 2)
-          if (devices.length >= 2) {
-            alert(`❌ Connection failed. Buzzer #${connectLocker} already has the maximum of 2 devices connected.`);
-            window.history.replaceState({}, document.title, window.location.pathname);
-            return;
-          }
+    const deviceId = getDeviceId();
+    const deviceName = getDeviceName();
 
-          // Add device
-          devices.push({ deviceId, deviceName, connectedAt: Date.now() });
-          set(ref(database, `users/${hostUid}/session/devices`), devices).then(() => {
-            alert(`🎉 Success! ${deviceName} connected to Buzzer #${connectLocker}.`);
-            window.history.replaceState({}, document.title, window.location.pathname);
-          });
+    const requestRef = ref(database, `connectionRequests/${hostUid}_${connectLocker}`);
 
-        } else {
-          alert("❌ Session invalid or expired.");
-          window.history.replaceState({}, document.title, window.location.pathname);
-        }
-      });
-    }
+    get(requestRef).then(snap => {
+      const existing = snap.val() || [];
+      const safeList = Array.isArray(existing) ? existing : Object.values(existing);
+
+      if (safeList.find(d => d.deviceId === deviceId)) {
+        alert(`✅ This device (${deviceName}) is already connected to Buzzer #${connectLocker}.`);
+      } else if (safeList.length >= 2) {
+        alert(`❌ Max 2 devices already connected to Buzzer #${connectLocker}.`);
+      } else {
+        const updated = [...safeList, { deviceId, deviceName, connectedAt: Date.now() }];
+        set(requestRef, updated).then(() => {
+          alert(`🎉 ${deviceName} connected to Buzzer #${connectLocker}!`);
+        });
+      }
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }).catch(() => {
+      alert("❌ Connection failed. Check Firebase rules for connectionRequests path.");
+      window.history.replaceState({}, document.title, window.location.pathname);
+    });
   }, []);
 
   // --- CORE LISTENERS ---
   useEffect(() => {
-    let unsubscribeBalance, unsubscribeSession, unsubscribeGlobalLockers, unsubscribeActiveUser;
+    let unsubscribeBalance, unsubscribeSession, unsubscribeGlobalLockers, unsubscribeActiveUser, unsubscribeRate;
 
     const unsubscribeAuth = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
@@ -135,7 +128,21 @@ export default function BuzzNetDashboard() {
         });
 
         const sessionRef = ref(database, `users/${currentUser.uid}/session`);
-        unsubscribeSession = onValue(sessionRef, (snapshot) => setSession(snapshot.val()));
+        unsubscribeSession = onValue(sessionRef, (snapshot) => {
+          const sessionData = snapshot.val();
+          setSession(sessionData);
+
+          if (sessionData?.lockerId) {
+            const requestRef = ref(database, `connectionRequests/${currentUser.uid}_${sessionData.lockerId}`);
+            onValue(requestRef, (reqSnap) => {
+              const devices = reqSnap.val();
+              if (devices) {
+                const deviceList = Array.isArray(devices) ? devices : Object.values(devices);
+                set(ref(database, `users/${currentUser.uid}/session/devices`), deviceList);
+              }
+            });
+          }
+        });
       }
     });
 
@@ -150,6 +157,16 @@ export default function BuzzNetDashboard() {
       }
     });
 
+    // --- RATE LISTENER ---
+    const rateRef = ref(database, 'system/ratePerPeso');
+    unsubscribeRate = onValue(rateRef, (snapshot) => {
+      const val = snapshot.val();
+      if (val !== null && val !== undefined) {
+        setRatePerPeso(val);
+        setAdminRateInput(val);
+      }
+    });
+
     const activeUserRef = ref(database, 'activeUser');
     unsubscribeActiveUser = onValue(activeUserRef, (snapshot) => setActiveSlotUser(snapshot.val() || "none"));
 
@@ -159,6 +176,7 @@ export default function BuzzNetDashboard() {
       if (unsubscribeSession) unsubscribeSession();
       if (unsubscribeGlobalLockers) unsubscribeGlobalLockers();
       if (unsubscribeActiveUser) unsubscribeActiveUser();
+      if (unsubscribeRate) unsubscribeRate();
     };
   }, []);
 
@@ -280,7 +298,7 @@ export default function BuzzNetDashboard() {
     if (balance < spendAmount) { setStatusLog(`Error: Need ₱${spendAmount}.`); return; }
     if (availableLockers.length === 0) { setStatusLog("Error: Machine empty!"); return; }
 
-    const durationMs = spendAmount * 5 * 60 * 1000;
+    const durationMs = spendAmount * ratePerPeso * 60 * 1000;
     const lockersCopy = [...availableLockers];
     const targetLocker = lockersCopy.shift();
     set(ref(database, 'system/availableLockers'), lockersCopy);
@@ -289,7 +307,7 @@ export default function BuzzNetDashboard() {
       lockerId: targetLocker,
       expiresAt: Date.now() + durationMs,
       paidAmount: spendAmount,
-      devices: [] // Initialize empty devices array
+      devices: []
     });
     set(ref(database, `buzzers/${targetLocker}/duration`), durationMs);
     setStatusLog(`Locker #${targetLocker} dispensed.`);
@@ -306,7 +324,8 @@ export default function BuzzNetDashboard() {
 
   const handleCloseLocker = (targetUid, lockerId) => {
     if (!targetUid || !lockerId) return;
-    set(ref(database, `users/${targetUid}/session`), null); // This clears session + devices
+    set(ref(database, `users/${targetUid}/session`), null);
+    set(ref(database, `connectionRequests/${targetUid}_${lockerId}`), null);
     get(ref(database, 'system/availableLockers')).then(snap => {
       const rawData = snap.val();
       const current = Array.isArray(rawData) ? rawData : Object.values(rawData || {});
@@ -328,6 +347,17 @@ export default function BuzzNetDashboard() {
     }
   };
 
+  // --- SET RATE HANDLER ---
+  const handleSetRate = () => {
+    const parsed = Number(adminRateInput);
+    if (!parsed || parsed <= 0) {
+      setStatusLog("Error: Rate must be a positive number.");
+      return;
+    }
+    set(ref(database, 'system/ratePerPeso'), parsed);
+    setStatusLog(`Rate updated: ₱1 = ${parsed} mins.`);
+  };
+
   if (loading) return <div style={{ backgroundColor: '#000', height: '100vh' }}></div>;
   if (!user && !isAdmin) return <Auth />;
 
@@ -337,7 +367,6 @@ export default function BuzzNetDashboard() {
   const totalUsers = Object.keys(allUsers).length;
   const totalCashInSystem = Object.values(allUsers).reduce((sum, u) => sum + (u.balance || 0), 0);
 
-  // Connection Data
   const connectedDevices = session?.devices || [];
   const qrLink = session ? `${window.location.origin}${window.location.pathname}?lockerId=${session.lockerId}&host=${user.uid}` : '';
 
@@ -378,7 +407,7 @@ export default function BuzzNetDashboard() {
   // =============================================
   // REUSABLE COMPONENTS
   // =============================================
-  
+
   const LockerGrid = () => (
     <div style={{ backgroundColor: '#000', padding: '20px', borderRadius: '8px', border: `1px solid ${colors.border}` }}>
       <div style={{ color: colors.muted, fontSize: '0.8em', textTransform: 'uppercase', marginBottom: '10px' }}>
@@ -439,13 +468,54 @@ export default function BuzzNetDashboard() {
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {connectedDevices.map((d, i) => (
-             <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#000', padding: '10px', borderRadius: '6px' }}>
-                <span style={{ color: '#fff', fontSize: '0.9em', fontWeight: 'bold' }}>{d.deviceName}</span>
-                <span style={{ color: '#00ffcc', fontSize: '0.7em', padding: '2px 6px', border: '1px solid #00ffcc', borderRadius: '10px' }}>CONNECTED</span>
-             </div>
+            <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#000', padding: '10px', borderRadius: '6px' }}>
+              <span style={{ color: '#fff', fontSize: '0.9em', fontWeight: 'bold' }}>{d.deviceName}</span>
+              <span style={{ color: '#00ffcc', fontSize: '0.7em', padding: '2px 6px', border: '1px solid #00ffcc', borderRadius: '10px' }}>CONNECTED</span>
+            </div>
           ))}
         </div>
       )}
+    </div>
+  );
+
+  // =============================================
+  //  ADMIN — RATE CONTROL PANEL (reused in desktop + mobile)
+  // =============================================
+  const RateControlPanel = () => (
+    <div style={{ backgroundColor: '#000', padding: '16px', borderRadius: '8px', border: `1px solid ${colors.border}` }}>
+      <div style={{ color: colors.muted, fontSize: '0.75em', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '12px' }}>
+        Peso → Time Rate
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '10px', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ color: colors.muted, fontSize: '0.85em', whiteSpace: 'nowrap' }}>₱1 =</span>
+          <input
+            type="number"
+            min="1"
+            value={adminRateInput}
+            onChange={(e) => setAdminRateInput(e.target.value)}
+            style={{
+              padding: '8px', borderRadius: '6px', border: `1px solid ${colors.border}`,
+              backgroundColor: '#111', color: colors.primary, fontSize: '1em',
+              outline: 'none', fontWeight: 'bold', textAlign: 'center', width: '70px'
+            }}
+          />
+          <span style={{ color: colors.muted, fontSize: '0.85em' }}>mins</span>
+        </div>
+        <button
+          onClick={handleSetRate}
+          style={{
+            padding: '9px 16px', backgroundColor: colors.primary, color: '#000',
+            border: 'none', borderRadius: '6px', fontWeight: '900', cursor: 'pointer',
+            fontSize: '0.8em', textTransform: 'uppercase', whiteSpace: 'nowrap'
+          }}
+        >
+          SET RATE
+        </button>
+      </div>
+      <div style={{ color: '#555', fontSize: '0.75em', marginTop: '10px' }}>
+        Current live rate: <span style={{ color: colors.primary, fontWeight: 'bold' }}>₱1 = {ratePerPeso} min{ratePerPeso !== 1 ? 's' : ''}</span>
+      </div>
     </div>
   );
 
@@ -465,7 +535,7 @@ export default function BuzzNetDashboard() {
         </div>
         <div style={{ textAlign: 'right' }}>
           <div style={{ color: colors.muted, fontSize: '0.75em' }}>Rate</div>
-          <div style={{ color: '#fff', fontWeight: 'bold', fontSize: '0.9em' }}>₱1 = 5 mins</div>
+          <div style={{ color: '#fff', fontWeight: 'bold', fontSize: '0.9em' }}>₱1 = {ratePerPeso} mins</div>
         </div>
       </div>
 
@@ -487,7 +557,7 @@ export default function BuzzNetDashboard() {
                 border: `1px solid ${colors.border}`, borderRadius: '6px',
                 color: '#fff', fontWeight: 'bold', whiteSpace: 'nowrap', flexShrink: 0, fontSize: '0.9em'
               }}>
-                = <span style={{ color: colors.primary, margin: '0 5px' }}>{spendAmount * 5}</span> MINS
+                = <span style={{ color: colors.primary, margin: '0 5px' }}>{spendAmount * ratePerPeso}</span> MINS
               </div>
             </div>
           </div>
@@ -525,14 +595,13 @@ export default function BuzzNetDashboard() {
             <span>Session Cost: <strong style={{ color: colors.primary }}>₱{session.paidAmount || 0}</strong></span>
           </div>
 
-          {/* QR Button & Device List */}
-          <button 
+          <button
             onClick={() => setShowQR(true)}
             style={{ ...btnOutline, padding: '10px', marginBottom: '10px', fontSize: '0.8em' }}
           >
             SHOW QR CODE TO CONNECT
           </button>
-          
+
           <ConnectedDevicesList />
 
           <button
@@ -618,15 +687,10 @@ export default function BuzzNetDashboard() {
             <p style={{ margin: 0, color: colors.muted, fontSize: '0.9em', textAlign: 'center' }}>
               Scan this code with your device camera to link it to Buzzer #{session.lockerId}. (Limit 2)
             </p>
-            
             <div style={{ backgroundColor: '#fff', padding: '15px', borderRadius: '8px' }}>
               <QRCodeCanvas value={qrLink} size={200} />
             </div>
-
-            <button 
-              onClick={() => setShowQR(false)}
-              style={{ ...btnPrimary, padding: '12px', marginTop: '10px' }}
-            >
+            <button onClick={() => setShowQR(false)} style={{ ...btnPrimary, padding: '12px', marginTop: '10px' }}>
               CLOSE
             </button>
           </div>
@@ -634,7 +698,7 @@ export default function BuzzNetDashboard() {
       )}
 
       {/* =============================================
-          MAIN LAYOUT RENDER 
+          MAIN LAYOUT RENDER
           ============================================= */}
       {isMobile ? (
         <div style={{
@@ -680,10 +744,8 @@ export default function BuzzNetDashboard() {
                       <div style={{ backgroundColor: '#000', padding: '25px', borderRadius: '12px', border: `2px solid ${colors.primary}`, textAlign: 'center' }}>
                         <div style={{ color: colors.muted, fontSize: '0.9em', letterSpacing: '2px', marginBottom: '10px' }}>LOCKER #{session.lockerId} ACTIVE</div>
                         <div style={{ fontSize: '4.5rem', fontWeight: '900', color: colors.primary, fontFamily: 'monospace', marginBottom: '15px' }}>{formatTime(timeLeft)}</div>
-                        
                         <button onClick={() => setShowQR(true)} style={{ ...btnOutline, padding: '10px', marginBottom: '10px', fontSize: '0.8em' }}>SHOW QR CODE</button>
                         <ConnectedDevicesList />
-
                         <button onClick={() => handleCloseLocker(user.uid, session.lockerId)} style={{ padding: '14px', backgroundColor: '#1a0505', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', textTransform: 'uppercase', width: '100%', marginTop: '15px' }}>Return Buzzer Early</button>
                       </div>
                     ) : (
@@ -704,13 +766,21 @@ export default function BuzzNetDashboard() {
                       <span style={{ color: activeSlotUser !== "none" ? colors.primary : '#555', fontWeight: 'bold', fontSize: '0.85em' }}>{activeSlotUser === "none" ? "IDLE" : `LOCKED`}</span>
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                      {[{ label: 'Active Sessions', value: activeBuzzersList.length, color: colors.primary }, { label: 'Total Users', value: totalUsers, color: '#fff' }, { label: 'System Wallet', value: `₱${totalCashInSystem}`, color: colors.primary }].map(item => (
+                      {[
+                        { label: 'Active Sessions', value: activeBuzzersList.length, color: colors.primary },
+                        { label: 'Total Users', value: totalUsers, color: '#fff' },
+                        { label: 'System Wallet', value: `₱${totalCashInSystem}`, color: colors.primary }
+                      ].map(item => (
                         <div key={item.label} style={{ backgroundColor: '#000', padding: '16px', borderRadius: '8px', border: `1px solid ${colors.border}` }}>
                           <div style={{ color: colors.muted, fontSize: '0.75em', textTransform: 'uppercase', marginBottom: '6px' }}>{item.label}</div>
                           <div style={{ fontWeight: '900', fontSize: '1.3em', color: item.color }}>{item.value}</div>
                         </div>
                       ))}
                     </div>
+
+                    {/* Rate Control — Mobile Admin */}
+                    <RateControlPanel />
+
                     <StatusTerminal compact={true} />
                   </>
                 )}
@@ -722,8 +792,23 @@ export default function BuzzNetDashboard() {
 
           {/* Bottom Tab Bar */}
           <div style={{ position: 'fixed', bottom: 0, left: 0, right: 0, backgroundColor: colors.panel, borderTop: `1px solid ${colors.border}`, display: 'flex', zIndex: 20, paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}>
-            {(isAdmin ? [{ id: 'main', label: 'Overview' }, { id: 'users', label: 'Users' }, { id: 'lockers', label: 'Lockers' }] : [{ id: 'main', label: 'Wallet' }, { id: 'session', label: 'Session' }, { id: 'lockers', label: 'Lockers' }]).map(tab => (
-              <button key={tab.id} onClick={() => setMobileTab(tab.id)} style={{ flex: 1, padding: '14px 8px', backgroundColor: 'transparent', color: mobileTab === tab.id ? colors.primary : colors.muted, border: 'none', cursor: 'pointer', fontWeight: mobileTab === tab.id ? '900' : 'normal', fontSize: '0.75em', textTransform: 'uppercase', letterSpacing: '0.5px', borderTop: mobileTab === tab.id ? `2px solid ${colors.primary}` : '2px solid transparent', transition: 'all 0.15s' }}>
+            {(isAdmin
+              ? [{ id: 'main', label: 'Overview' }, { id: 'users', label: 'Users' }, { id: 'lockers', label: 'Lockers' }]
+              : [{ id: 'main', label: 'Wallet' }, { id: 'session', label: 'Session' }, { id: 'lockers', label: 'Lockers' }]
+            ).map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setMobileTab(tab.id)}
+                style={{
+                  flex: 1, padding: '14px 8px', backgroundColor: 'transparent',
+                  color: mobileTab === tab.id ? colors.primary : colors.muted,
+                  border: 'none', cursor: 'pointer',
+                  fontWeight: mobileTab === tab.id ? '900' : 'normal',
+                  fontSize: '0.75em', textTransform: 'uppercase', letterSpacing: '0.5px',
+                  borderTop: mobileTab === tab.id ? `2px solid ${colors.primary}` : '2px solid transparent',
+                  transition: 'all 0.15s'
+                }}
+              >
                 {tab.label}
               </button>
             ))}
@@ -732,7 +817,7 @@ export default function BuzzNetDashboard() {
       ) : (
         /* DESKTOP LAYOUT */
         <div style={{ display: 'flex', width: '100vw', height: '100vh', backgroundColor: colors.bg, color: colors.text, fontFamily: 'sans-serif', overflow: 'hidden' }}>
-          
+
           {/* LEFT PANEL */}
           <div style={{ width: '350px', minWidth: '350px', backgroundColor: colors.panel, borderRight: `1px solid ${colors.border}`, padding: '30px', display: 'flex', flexDirection: 'column', gap: '25px', overflowY: 'auto', zIndex: 10 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: `1px solid ${colors.border}`, paddingBottom: '20px' }}>
@@ -743,10 +828,7 @@ export default function BuzzNetDashboard() {
               <button onClick={handleLogout} style={{ padding: '6px 12px', backgroundColor: 'transparent', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '6px', cursor: 'pointer', fontSize: '0.8em', fontWeight: 'bold' }}>LOGOUT</button>
             </div>
 
-            {isAdmin ? (
-               // ... Admin specific stuff
-               <></>
-            ) : (
+            {!isAdmin && (
               <>
                 <div>
                   <h3 style={{ color: colors.muted, fontSize: '0.85em', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '15px' }}>Active Session</h3>
@@ -754,11 +836,8 @@ export default function BuzzNetDashboard() {
                     <div style={{ backgroundColor: '#000', padding: '25px', borderRadius: '12px', border: `2px solid ${colors.primary}`, textAlign: 'center' }}>
                       <div style={{ color: colors.muted, fontSize: '0.9em', letterSpacing: '2px', marginBottom: '10px' }}>LOCKER #{session.lockerId} ACTIVE</div>
                       <div style={{ fontSize: '4rem', fontWeight: '900', color: colors.primary, fontFamily: 'monospace', textShadow: '0 0 20px rgba(255,204,0,0.4)', marginBottom: '15px' }}>{formatTime(timeLeft)}</div>
-                      
-                      {/* ADDED QR SYSTEM COMPONENTS */}
                       <button onClick={() => setShowQR(true)} style={{ ...btnOutline, padding: '10px', fontSize: '0.8em' }}>SHOW QR CODE</button>
                       <ConnectedDevicesList />
-
                       <button onClick={() => handleCloseLocker(user.uid, session.lockerId)} style={{ padding: '12px 20px', backgroundColor: '#1a0505', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', textTransform: 'uppercase', width: '100%', marginTop: '15px' }}>Return Buzzer Early</button>
                     </div>
                   ) : (
@@ -772,20 +851,28 @@ export default function BuzzNetDashboard() {
 
           {/* CENTER PANEL — SPLINE 3D */}
           <div style={{ flex: 1, position: 'relative', display: 'flex', flexDirection: 'column' }}>
-            <Spline scene="https://prod.spline.design/H-eYBpbnLnl3xm57/scene.splinecode?v=2" onLoad={onLoad} style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }} />
+            <Spline
+              scene="https://prod.spline.design/H-eYBpbnLnl3xm57/scene.splinecode?v=2"
+              onLoad={onLoad}
+              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }}
+            />
             <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '100px', background: 'linear-gradient(to bottom, #050505 0%, transparent 100%)', pointerEvents: 'none' }}></div>
           </div>
 
           {/* RIGHT PANEL */}
           <div style={{ width: isAdmin ? '500px' : '400px', minWidth: isAdmin ? '500px' : '400px', backgroundColor: colors.panel, borderLeft: `1px solid ${colors.border}`, padding: '30px', display: 'flex', flexDirection: 'column', gap: '25px', overflowY: 'auto', overflowX: 'hidden', zIndex: 10 }}>
             {isAdmin ? (
-               <>
-                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#000', padding: '15px 20px', borderRadius: '8px', border: `1px solid ${colors.border}` }}>
-                   <span style={{ color: colors.muted, fontWeight: 'bold', textTransform: 'uppercase', fontSize: '0.85em' }}>Coin Slot Status</span>
-                   <span style={{ color: activeSlotUser !== "none" ? colors.primary : '#555', fontWeight: 'bold' }}>{activeSlotUser === "none" ? "IDLE" : `LOCKED`}</span>
-                 </div>
-                 <div style={{ flexGrow: 1 }}><AdminUserTable /></div>
-               </>
+              <>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#000', padding: '15px 20px', borderRadius: '8px', border: `1px solid ${colors.border}` }}>
+                  <span style={{ color: colors.muted, fontWeight: 'bold', textTransform: 'uppercase', fontSize: '0.85em' }}>Coin Slot Status</span>
+                  <span style={{ color: activeSlotUser !== "none" ? colors.primary : '#555', fontWeight: 'bold' }}>{activeSlotUser === "none" ? "IDLE" : `LOCKED`}</span>
+                </div>
+
+                {/* Rate Control — Desktop Admin */}
+                <RateControlPanel />
+
+                <div style={{ flexGrow: 1 }}><AdminUserTable /></div>
+              </>
             ) : (
               <>
                 <div style={{ ...panelStyle, border: 'none', backgroundColor: 'transparent', padding: 0 }}>
@@ -798,9 +885,18 @@ export default function BuzzNetDashboard() {
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                         <label style={{ color: colors.muted, fontWeight: 'bold', textTransform: 'uppercase', fontSize: '0.85em' }}>Amount to Spend (₱)</label>
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '10px', overflow: 'hidden' }}>
-                          <input type="number" min="1" value={spendAmount} onChange={(e) => setSpendAmount(Number(e.target.value))} style={{ ...inputStyle, width: '100%', minWidth: 0, boxSizing: 'border-box' }} />
-                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 15px', backgroundColor: '#000', border: `1px solid ${colors.border}`, borderRadius: '6px', color: '#fff', fontWeight: 'bold', whiteSpace: 'nowrap', flexShrink: 0 }}>
-                            = <span style={{ color: colors.primary, margin: '0 5px' }}>{spendAmount * 5}</span> MINS
+                          <input
+                            type="number" min="1" value={spendAmount}
+                            onChange={(e) => setSpendAmount(Number(e.target.value))}
+                            style={{ ...inputStyle, width: '100%', minWidth: 0, boxSizing: 'border-box' }}
+                          />
+                          <div style={{
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            padding: '0 15px', backgroundColor: '#000',
+                            border: `1px solid ${colors.border}`, borderRadius: '6px',
+                            color: '#fff', fontWeight: 'bold', whiteSpace: 'nowrap', flexShrink: 0
+                          }}>
+                            = <span style={{ color: colors.primary, margin: '0 5px' }}>{spendAmount * ratePerPeso}</span> MINS
                           </div>
                         </div>
                       </div>
@@ -815,14 +911,18 @@ export default function BuzzNetDashboard() {
                       ) : (
                         <button onClick={handleActivateSlot} style={btnOutline}>Activate Coin Slot</button>
                       )}
-                      <button onClick={handleDispense} style={{ ...btnPrimary, marginTop: '10px', backgroundColor: session ? '#222' : colors.primary, color: session ? '#555' : '#000' }} disabled={session != null}>
+                      <button
+                        onClick={handleDispense}
+                        style={{ ...btnPrimary, marginTop: '10px', backgroundColor: session ? '#222' : colors.primary, color: session ? '#555' : '#000' }}
+                        disabled={session != null}
+                      >
                         CHECKOUT BUZZER
                       </button>
                     </>
                   ) : (
                     <div style={{ textAlign: 'center', padding: '30px 10px', color: colors.muted }}>
                       <div style={{ fontSize: '2em', marginBottom: '10px' }}>🔒</div>
-                      You currently have a buzzer checked out..<br />Wait for the session to expire to rent another.
+                      You currently have a buzzer checked out.<br />Wait for the session to expire to rent another.
                     </div>
                   )}
                 </div>
