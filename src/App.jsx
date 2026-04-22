@@ -45,11 +45,14 @@ export default function BuzzNetDashboard() {
 
   const [balance, setBalance] = useState(0);
   const [isDisabled, setIsDisabled] = useState(false);
-  const [spendAmount, setSpendAmount] = useState(1);
+  const [spendAmount, setSpendAmount] = useState(0);
   const [statusLog, setStatusLog] = useState("System Ready. Master Database Connected.");
 
   const [session, setSession] = useState(null);
   const [timeLeft, setTimeLeft] = useState(0);
+
+  // ✅ CHANGE 1: New timeCredit state (stored in ms)
+  const [timeCredit, setTimeCredit] = useState(0);
 
   // QR Code Modal State
   const [showQR, setShowQR] = useState(false);
@@ -57,6 +60,17 @@ export default function BuzzNetDashboard() {
   // --- RATE STATE ---
   const [ratePerPeso, setRatePerPeso] = useState(5);
   const [adminRateInput, setAdminRateInput] = useState(5);
+
+  // Helper: convert ms to "Xm Ys" display string
+  const formatCredit = (ms) => {
+    if (ms <= 0) return null;
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    if (m === 0) return `${s}s`;
+    if (s === 0) return `${m}m`;
+    return `${m}m ${s}s`;
+  };
 
   // --- RESPONSIVE LISTENER ---
   useEffect(() => {
@@ -120,6 +134,8 @@ export default function BuzzNetDashboard() {
           if (data) {
             setBalance(data.balance || 0);
             setIsDisabled(data.isDisabled || false);
+            // ✅ CHANGE 2: Read timeCredit from Firebase whenever user data updates
+            setTimeCredit(data.timeCredit || 0);
             if (data.isDisabled) {
               handleLogout();
               alert("Your account has been disabled by the administrator.");
@@ -199,12 +215,12 @@ export default function BuzzNetDashboard() {
       const remainingMs = session.expiresAt - Date.now();
       if (remainingMs <= 0) {
         clearInterval(interval);
-        handleCloseLocker(user.uid, session.lockerId);
+        handleCloseLocker(user.uid, session.lockerId, 0);
       } else {
         setTimeLeft(remainingMs);
       }
     }, 1000);
-    if (session.expiresAt - Date.now() <= 0) handleCloseLocker(user.uid, session.lockerId);
+    if (session.expiresAt - Date.now() <= 0) handleCloseLocker(user.uid, session.lockerId, 0);
     return () => clearInterval(interval);
   }, [session, user]);
 
@@ -214,7 +230,7 @@ export default function BuzzNetDashboard() {
       const now = Date.now();
       Object.entries(allUsers).forEach(([uid, data]) => {
         if (data.session && data.session.expiresAt <= now) {
-          handleCloseLocker(uid, data.session.lockerId);
+          handleCloseLocker(uid, data.session.lockerId, 0);
         }
       });
     }, 5000);
@@ -294,23 +310,36 @@ export default function BuzzNetDashboard() {
   const handleDispense = () => {
     if (isDisabled) return;
     if (session) { setStatusLog("Error: Active locker exists."); return; }
-    if (spendAmount <= 0) { setStatusLog("Error: Invalid amount."); return; }
+    if (spendAmount < 0) { setStatusLog("Error: Invalid amount."); return; } // Allow 0
     if (balance < spendAmount) { setStatusLog(`Error: Need ₱${spendAmount}.`); return; }
+    
+    const paidDurationMs = spendAmount * ratePerPeso * 60 * 1000;
+    const totalDurationMs = paidDurationMs + timeCredit;
+
+    // NEW: Check if there is actual time to dispense (either from cash or credit)
+    if (totalDurationMs <= 0) { 
+      setStatusLog("Error: Enter an amount or use saved credit."); 
+      return; 
+    }
+    
     if (availableLockers.length === 0) { setStatusLog("Error: Machine empty!"); return; }
 
-    const durationMs = spendAmount * ratePerPeso * 60 * 1000;
     const lockersCopy = [...availableLockers];
     const targetLocker = lockersCopy.shift();
     set(ref(database, 'system/availableLockers'), lockersCopy);
     set(ref(database, `users/${user.uid}/balance`), balance - spendAmount);
+    set(ref(database, `users/${user.uid}/timeCredit`), 0);
     set(ref(database, `users/${user.uid}/session`), {
       lockerId: targetLocker,
-      expiresAt: Date.now() + durationMs,
+      expiresAt: Date.now() + totalDurationMs,
       paidAmount: spendAmount,
+      creditApplied: timeCredit,  
       devices: []
     });
-    set(ref(database, `buzzers/${targetLocker}/duration`), durationMs);
-    setStatusLog(`Locker #${targetLocker} dispensed.`);
+    set(ref(database, `buzzers/${targetLocker}/duration`), totalDurationMs);
+
+    const creditMsg = timeCredit > 0 ? ` (+${formatCredit(timeCredit)} credit applied)` : '';
+    setStatusLog(`Locker #${targetLocker} dispensed.${creditMsg}`);
 
     if (splineRef.current) {
       splineRef.current.setVariable('TargetLocker', -1);
@@ -321,9 +350,21 @@ export default function BuzzNetDashboard() {
       }, 50);
     }
   };
-
-  const handleCloseLocker = (targetUid, lockerId) => {
+  // ✅ CHANGE 4: handleCloseLocker now accepts remainingMs and saves it as timeCredit
+  // remainingMs = 0 means the session expired naturally (no credit)
+  const handleCloseLocker = (targetUid, lockerId, remainingMs) => {
     if (!targetUid || !lockerId) return;
+
+    // Save remaining time as credit for the user's next session
+    // Only save if there is remaining time (i.e., returned early, not expired)
+    const creditToSave = (typeof remainingMs === 'number' && remainingMs > 0) ? remainingMs : 0;
+    if (creditToSave > 0) {
+      get(ref(database, `users/${targetUid}/timeCredit`)).then(snap => {
+        const existing = snap.val() || 0;
+        set(ref(database, `users/${targetUid}/timeCredit`), existing + creditToSave);
+      });
+    }
+
     set(ref(database, `users/${targetUid}/session`), null);
     set(ref(database, `connectionRequests/${targetUid}_${lockerId}`), null);
     get(ref(database, 'system/availableLockers')).then(snap => {
@@ -336,7 +377,14 @@ export default function BuzzNetDashboard() {
       }
     });
     set(ref(database, `buzzers/${lockerId}/duration`), -1);
-    setStatusLog(isAdmin ? `Admin Sweep: Locker #${lockerId} returned.` : `Session ended. Locker #${lockerId} closed.`);
+
+    const creditMsg = creditToSave > 0 ? ` ${formatCredit(creditToSave)} saved as credit.` : '';
+    setStatusLog(
+      isAdmin
+        ? `Admin Sweep: Locker #${lockerId} returned.`
+        : `Session ended. Locker #${lockerId} closed.${creditMsg}`
+    );
+
     if (splineRef.current) {
       splineRef.current.setVariable('TargetLocker', -1);
       splineRef.current.setVariable('DoorStatus', 0);
@@ -479,6 +527,35 @@ export default function BuzzNetDashboard() {
   );
 
   // =============================================
+  // ✅ CHANGE 5: TimeCreditBadge — shown wherever checkout is available
+  // =============================================
+  const TimeCreditBadge = () => {
+    if (!timeCredit || timeCredit <= 0) return null;
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        backgroundColor: '#0d0d00', border: `1px solid ${colors.primary}`,
+        borderRadius: '8px', padding: '10px 14px'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '1em' }}>⏱</span>
+          <div>
+            <div style={{ color: colors.muted, fontSize: '0.7em', textTransform: 'uppercase', letterSpacing: '1px' }}>
+              Saved Time Credit
+            </div>
+            <div style={{ color: colors.primary, fontWeight: '900', fontSize: '1em', fontFamily: 'monospace' }}>
+              +{formatCredit(timeCredit)}
+            </div>
+          </div>
+        </div>
+        <div style={{ color: '#555', fontSize: '0.72em', textAlign: 'right', maxWidth: '100px', lineHeight: '1.3' }}>
+          Auto-applied on next checkout
+        </div>
+      </div>
+    );
+  };
+
+  // =============================================
   //  ADMIN — RATE CONTROL PANEL (reused in desktop + mobile)
   // =============================================
   const RateControlPanel = () => (
@@ -539,6 +616,9 @@ export default function BuzzNetDashboard() {
         </div>
       </div>
 
+      {/* Show time credit badge whenever user has one */}
+      <TimeCreditBadge />
+
       {!session ? (
         <div style={panelStyle}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -547,17 +627,27 @@ export default function BuzzNetDashboard() {
             </label>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '10px' }}>
               <input
-                type="number" min="1" value={spendAmount}
+                type="number" min="0" value={spendAmount}
                 onChange={(e) => setSpendAmount(Number(e.target.value))}
                 style={{ ...inputStyle, width: '100%', minWidth: 0, boxSizing: 'border-box' }}
               />
+              {/* Show total time including credit in the preview */}
               <div style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                 padding: '0 12px', backgroundColor: '#000',
                 border: `1px solid ${colors.border}`, borderRadius: '6px',
                 color: '#fff', fontWeight: 'bold', whiteSpace: 'nowrap', flexShrink: 0, fontSize: '0.9em'
               }}>
-                = <span style={{ color: colors.primary, margin: '0 5px' }}>{spendAmount * ratePerPeso}</span> MINS
+                =&nbsp;
+                <span style={{ color: colors.primary, margin: '0 2px' }}>
+                  {Math.floor((spendAmount * ratePerPeso * 60 * 1000 + timeCredit) / 60000)}
+                </span>
+                &nbsp;MINS
+                {timeCredit > 0 && (
+                  <span style={{ color: '#00ffcc', fontSize: '0.75em', marginLeft: '4px' }}>
+                    (+{formatCredit(timeCredit)})
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -593,6 +683,9 @@ export default function BuzzNetDashboard() {
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '15px', fontSize: '0.85em', color: colors.muted }}>
             <span>Session Cost: <strong style={{ color: colors.primary }}>₱{session.paidAmount || 0}</strong></span>
+            {session.creditApplied > 0 && (
+              <span>Credit Used: <strong style={{ color: '#00ffcc' }}>+{formatCredit(session.creditApplied)}</strong></span>
+            )}
           </div>
 
           <button
@@ -604,8 +697,9 @@ export default function BuzzNetDashboard() {
 
           <ConnectedDevicesList />
 
+          {/* ✅ Pass current timeLeft so remaining time is saved as credit */}
           <button
-            onClick={() => handleCloseLocker(user.uid, session.lockerId)}
+            onClick={() => handleCloseLocker(user.uid, session.lockerId, timeLeft)}
             style={{
               padding: '12px 20px', backgroundColor: '#1a0505', color: colors.danger,
               border: `1px solid ${colors.danger}`, borderRadius: '6px', marginTop: '15px',
@@ -632,7 +726,7 @@ export default function BuzzNetDashboard() {
         }}>
           <thead>
             <tr style={{ borderBottom: `2px solid ${colors.primary}` }}>
-              {['Email', 'ID', 'Bal', 'Locker', 'Action'].map(h => (
+              {['Email', 'ID', 'Bal', 'Credit', 'Locker', 'Action'].map(h => (
                 <th key={h} style={{ padding: '10px 6px', color: colors.primary, whiteSpace: 'nowrap' }}>{h}</th>
               ))}
             </tr>
@@ -645,6 +739,10 @@ export default function BuzzNetDashboard() {
                 </td>
                 <td style={{ padding: '10px 6px', color: colors.muted }}>{data.idNumber || '-'}</td>
                 <td style={{ padding: '10px 6px', fontWeight: 'bold', color: '#fff', whiteSpace: 'nowrap' }}>₱{data.balance || 0}</td>
+                {/* ✅ Show time credit in admin table */}
+                <td style={{ padding: '10px 6px', color: '#00ffcc', fontWeight: 'bold', whiteSpace: 'nowrap' }}>
+                  {data.timeCredit > 0 ? formatCredit(data.timeCredit) : '-'}
+                </td>
                 <td style={{ padding: '10px 6px', color: colors.primary, fontWeight: 'bold' }}>
                   {data.session ? `#${data.session.lockerId}` : '-'}
                 </td>
@@ -729,6 +827,16 @@ export default function BuzzNetDashboard() {
                   {formatTime(timeLeft)}
                 </div>
               )}
+              {/* Show credit indicator in header if no active session */}
+              {!session && timeCredit > 0 && (
+                <div style={{
+                  backgroundColor: '#001a0d', border: '1px solid #00ffcc',
+                  borderRadius: '20px', padding: '4px 10px',
+                  color: '#00ffcc', fontWeight: '900', fontFamily: 'monospace', fontSize: '0.8em'
+                }}>
+                  +{formatCredit(timeCredit)}
+                </div>
+              )}
               <button onClick={handleLogout} style={{ padding: '6px 12px', backgroundColor: 'transparent', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '6px', cursor: 'pointer', fontSize: '0.75em', fontWeight: 'bold' }}>OUT</button>
             </div>
           </div>
@@ -744,9 +852,15 @@ export default function BuzzNetDashboard() {
                       <div style={{ backgroundColor: '#000', padding: '25px', borderRadius: '12px', border: `2px solid ${colors.primary}`, textAlign: 'center' }}>
                         <div style={{ color: colors.muted, fontSize: '0.9em', letterSpacing: '2px', marginBottom: '10px' }}>LOCKER #{session.lockerId} ACTIVE</div>
                         <div style={{ fontSize: '4.5rem', fontWeight: '900', color: colors.primary, fontFamily: 'monospace', marginBottom: '15px' }}>{formatTime(timeLeft)}</div>
+                        {session.creditApplied > 0 && (
+                          <div style={{ color: '#00ffcc', fontSize: '0.8em', marginBottom: '10px' }}>
+                            Credit Applied: +{formatCredit(session.creditApplied)}
+                          </div>
+                        )}
                         <button onClick={() => setShowQR(true)} style={{ ...btnOutline, padding: '10px', marginBottom: '10px', fontSize: '0.8em' }}>SHOW QR CODE</button>
                         <ConnectedDevicesList />
-                        <button onClick={() => handleCloseLocker(user.uid, session.lockerId)} style={{ padding: '14px', backgroundColor: '#1a0505', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', textTransform: 'uppercase', width: '100%', marginTop: '15px' }}>Return Buzzer Early</button>
+                        {/* ✅ Pass timeLeft here too for mobile session tab */}
+                        <button onClick={() => handleCloseLocker(user.uid, session.lockerId, timeLeft)} style={{ padding: '14px', backgroundColor: '#1a0505', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold', textTransform: 'uppercase', width: '100%', marginTop: '15px' }}>Return Buzzer Early</button>
                       </div>
                     ) : (
                       <div style={{ backgroundColor: '#000', padding: '40px', borderRadius: '12px', border: `1px dashed ${colors.border}`, textAlign: 'center', color: colors.muted }}>No active session. Go to Wallet to rent a buzzer.</div>
@@ -836,12 +950,22 @@ export default function BuzzNetDashboard() {
                     <div style={{ backgroundColor: '#000', padding: '25px', borderRadius: '12px', border: `2px solid ${colors.primary}`, textAlign: 'center' }}>
                       <div style={{ color: colors.muted, fontSize: '0.9em', letterSpacing: '2px', marginBottom: '10px' }}>LOCKER #{session.lockerId} ACTIVE</div>
                       <div style={{ fontSize: '4rem', fontWeight: '900', color: colors.primary, fontFamily: 'monospace', textShadow: '0 0 20px rgba(255,204,0,0.4)', marginBottom: '15px' }}>{formatTime(timeLeft)}</div>
+                      {session.creditApplied > 0 && (
+                        <div style={{ color: '#00ffcc', fontSize: '0.8em', marginBottom: '12px' }}>
+                          Credit Applied: +{formatCredit(session.creditApplied)}
+                        </div>
+                      )}
                       <button onClick={() => setShowQR(true)} style={{ ...btnOutline, padding: '10px', fontSize: '0.8em' }}>SHOW QR CODE</button>
                       <ConnectedDevicesList />
-                      <button onClick={() => handleCloseLocker(user.uid, session.lockerId)} style={{ padding: '12px 20px', backgroundColor: '#1a0505', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', textTransform: 'uppercase', width: '100%', marginTop: '15px' }}>Return Buzzer Early</button>
+                      {/* ✅ Pass timeLeft here for desktop left panel */}
+                      <button onClick={() => handleCloseLocker(user.uid, session.lockerId, timeLeft)} style={{ padding: '12px 20px', backgroundColor: '#1a0505', color: colors.danger, border: `1px solid ${colors.danger}`, borderRadius: '6px', cursor: 'pointer', fontWeight: 'bold', textTransform: 'uppercase', width: '100%', marginTop: '15px' }}>Return Buzzer Early</button>
                     </div>
                   ) : (
-                    <div style={{ backgroundColor: '#000', padding: '25px', borderRadius: '12px', border: `1px dashed ${colors.border}`, textAlign: 'center', color: colors.muted }}>No active buzzer.</div>
+                    <>
+                      {/* Show credit badge in left panel when no session */}
+                      <TimeCreditBadge />
+                      <div style={{ backgroundColor: '#000', padding: '25px', borderRadius: '12px', border: `1px dashed ${colors.border}`, textAlign: 'center', color: colors.muted, marginTop: timeCredit > 0 ? '12px' : 0 }}>No active buzzer.</div>
+                    </>
                   )}
                 </div>
               </>
@@ -886,17 +1010,27 @@ export default function BuzzNetDashboard() {
                         <label style={{ color: colors.muted, fontWeight: 'bold', textTransform: 'uppercase', fontSize: '0.85em' }}>Amount to Spend (₱)</label>
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '10px', overflow: 'hidden' }}>
                           <input
-                            type="number" min="1" value={spendAmount}
+                            type="number" min="0" value={spendAmount}
                             onChange={(e) => setSpendAmount(Number(e.target.value))}
                             style={{ ...inputStyle, width: '100%', minWidth: 0, boxSizing: 'border-box' }}
                           />
+                          {/* ✅ Show total duration including credit */}
                           <div style={{
                             display: 'flex', alignItems: 'center', justifyContent: 'center',
                             padding: '0 15px', backgroundColor: '#000',
                             border: `1px solid ${colors.border}`, borderRadius: '6px',
                             color: '#fff', fontWeight: 'bold', whiteSpace: 'nowrap', flexShrink: 0
                           }}>
-                            = <span style={{ color: colors.primary, margin: '0 5px' }}>{spendAmount * ratePerPeso}</span> MINS
+                            =&nbsp;
+                            <span style={{ color: colors.primary, margin: '0 4px' }}>
+                              {Math.floor((spendAmount * ratePerPeso * 60 * 1000 + timeCredit) / 60000)}
+                            </span>
+                            &nbsp;MINS
+                            {timeCredit > 0 && (
+                              <span style={{ color: '#00ffcc', fontSize: '0.75em', marginLeft: '5px' }}>
+                                (+{formatCredit(timeCredit)})
+                              </span>
+                            )}
                           </div>
                         </div>
                       </div>
