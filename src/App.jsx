@@ -406,6 +406,50 @@ export default function BuzzNetDashboard() {
     setStatusLog(`Rate updated: ₱1 = ${parsed} mins.`);
   };
 
+  const handleForceReturnAll = () => {
+  const allLockers = [1,2,3,4,5,6,7,8,9,10,11,12,13,14];
+  const busyLockers = allLockers.filter(id => !availableLockers.includes(id));
+  const active = Object.entries(allUsers).filter(([, data]) => data.session != null);
+  const sessionLockers = active.map(([, data]) => data.session.lockerId);
+  const orphanedLockers = busyLockers.filter(id => !sessionLockers.includes(id));
+
+  if (active.length === 0 && orphanedLockers.length === 0) {
+    setStatusLog("Nothing to clear — all lockers accounted for.");
+    return;
+  }
+
+  // Close real sessions
+  active.forEach(([uid, data]) => handleCloseLocker(uid, data.session.lockerId, 0));
+
+  // Recover orphaned lockers (busy in DB but no session owns them)
+  if (orphanedLockers.length > 0) {
+    get(ref(database, 'system/availableLockers')).then(snap => {
+      const rawData = snap.val();
+      const current = Array.isArray(rawData) ? rawData : Object.values(rawData || {});
+      const clean = current.filter(v => v !== null && v !== undefined);
+      const updated = [...new Set([...clean, ...orphanedLockers])].sort((a, b) => a - b);
+      set(ref(database, 'system/availableLockers'), updated);
+      orphanedLockers.forEach((id, i) => {
+        set(ref(database, `buzzers/${id}/duration`), -1);
+        if (splineRef.current) {
+          setTimeout(() => {
+            splineRef.current.setVariable('TargetLocker', -1);
+            splineRef.current.setVariable('DoorStatus', 0);
+            setTimeout(() => {
+              splineRef.current.setVariable('TargetLocker', id);
+              splineRef.current.setVariable('DoorStatus', 2);
+            }, 50);
+          }, i * 150);
+        }
+      });
+    });
+  }
+
+  setStatusLog(
+    `Cleared ${active.length} session(s) + ${orphanedLockers.length} orphaned locker(s). System synced.`
+  );
+}
+
   if (loading) return <div style={{ backgroundColor: '#000', height: '100vh' }}></div>;
   if (!user && !isAdmin) return <Auth />;
 
@@ -455,6 +499,45 @@ export default function BuzzNetDashboard() {
   // =============================================
   // REUSABLE COMPONENTS
   // =============================================
+
+  const ForceReturnAllBtn = () => {
+  const allLockers = [1,2,3,4,5,6,7,8,9,10,11,12,13,14];
+  const busyLockers = allLockers.filter(id => !availableLockers.includes(id));
+  const active = Object.entries(allUsers).filter(([, data]) => data.session != null);
+  const sessionLockers = active.map(([, data]) => data.session.lockerId);
+  const orphanedLockers = busyLockers.filter(id => !sessionLockers.includes(id));
+  const hasAnything = active.length > 0 || orphanedLockers.length > 0;
+
+  let label;
+  if (!hasAnything) {
+    label = 'Force Return All — Nothing to Clear';
+  } else if (active.length > 0 && orphanedLockers.length > 0) {
+    label = `⬅ Force Return All (${active.length} active, ${orphanedLockers.length} orphaned)`;
+  } else if (orphanedLockers.length > 0) {
+    label = `⬅ Fix Orphaned Lockers (${orphanedLockers.length} stuck)`;
+  } else {
+    label = `⬅ Force Return All (${active.length} active)`;
+  }
+
+  return (
+    <button
+      onClick={handleForceReturnAll}
+      disabled={!hasAnything}
+      style={{
+        padding: '14px', width: '100%', borderRadius: '8px',
+        backgroundColor: hasAnything ? '#1a0505' : '#111',
+        color: hasAnything ? colors.danger : '#444',
+        border: `1px solid ${hasAnything ? colors.danger : '#333'}`,
+        fontWeight: 'bold', textTransform: 'uppercase',
+        letterSpacing: '1px', cursor: hasAnything ? 'pointer' : 'not-allowed',
+        fontSize: '0.85em', transition: 'all 0.2s'
+      }}
+    >
+      {label}
+    </button>
+  );
+};
+
 
   const LockerGrid = () => (
     <div style={{ backgroundColor: '#000', padding: '20px', borderRadius: '8px', border: `1px solid ${colors.border}` }}>
@@ -894,7 +977,7 @@ export default function BuzzNetDashboard() {
 
                     {/* Rate Control — Mobile Admin */}
                     <RateControlPanel />
-
+                      <ForceReturnAllBtn />   {/* ← ADD THIS */}
                     <StatusTerminal compact={true} />
                   </>
                 )}
@@ -994,7 +1077,7 @@ export default function BuzzNetDashboard() {
 
                 {/* Rate Control — Desktop Admin */}
                 <RateControlPanel />
-
+                <ForceReturnAllBtn />   {/* ← ADD THIS */}
                 <div style={{ flexGrow: 1 }}><AdminUserTable /></div>
               </>
             ) : (
